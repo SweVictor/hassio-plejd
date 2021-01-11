@@ -1,22 +1,18 @@
 const dbus = require('dbus-next');
 const crypto = require('crypto');
 const xor = require('buffer-xor');
-const _ = require('lodash');
 const EventEmitter = require('events');
 
-let debug = '';
+const debug = true;
+const verbose = false;
 
-const getLogger = () => {
-  const consoleLogger = (...msg) => console.log('plejd-ble', ...msg);
-  if (debug === 'console') {
-    return consoleLogger;
-  }
+const consoleLogger = (...msg) => console.debug('plejd-ble', ...msg);
 
-  // > /dev/null
-  return _.noop;
-};
+const getLogger = (shouldLog) => shouldLog ? consoleLogger : () => {};
 
-const logger = getLogger();
+
+const logger = getLogger(debug);
+const vrbLogger = getLogger(verbose);
 
 // UUIDs
 const PLEJD_SERVICE = '31ba0001-6085-4726-be45-040c957391b5';
@@ -40,7 +36,7 @@ const GATT_SERVICE_ID = 'org.bluez.GattService1';
 const GATT_CHRC_ID = 'org.bluez.GattCharacteristic1';
 
 const MAX_TRANSITION_STEPS_PER_SECOND = 5; // Could be made a setting
-const MAX_WRITEQUEUE_LENGTH_TARGET = 0; // Could be made a setting. 0 => queue length = numDevices => 1 command pending per device max
+const MAX_RETRY_COUNT = 5; // Could be made a setting
 
 class PlejdService extends EventEmitter {
   constructor(cryptoKey, devices, sceneManager, connectionTimeout, writeQueueWaitTime, keepAlive = false) {
@@ -61,9 +57,6 @@ class PlejdService extends EventEmitter {
     this.writeQueue = [];
     this.writeQueueRef = null;
     
-    this.maxQueueLengthTarget = MAX_WRITEQUEUE_LENGTH_TARGET || this.devices.length || 5;
-    logger('Max global transition queue length target', this.maxQueueLengthTarget)
-
     // Holds a reference to all characteristics
     this.characteristics = {
       data: null,
@@ -99,8 +92,22 @@ class PlejdService extends EventEmitter {
     clearInterval(this.writeQueueRef);
     console.log('init()');
 
-    const bluez = await this.bus.getProxyObject(BLUEZ_SERVICE_NAME, '/');
-    this.objectManager = await bluez.getInterface(DBUS_OM_INTERFACE);
+    let bluez = null;
+    try {
+      console.log("Initializing bluez...");
+      bluez = await this.bus.getProxyObject(BLUEZ_SERVICE_NAME, '/');
+    }
+    catch {
+      console.error("Could not open bluez dbus proxy object. Something is wrong with the Bluetooth/Dbus setup. No point in continuing.");
+      return;
+    }
+    try {
+      this.objectManager = await bluez.getInterface(DBUS_OM_INTERFACE);
+    }
+    catch {
+      console.error("Could not get objectmanager");
+      return;
+    }
 
     // We need to find the ble interface which implements the Adapter1 interface
     const managedObjects = await this.objectManager.GetManagedObjects();
@@ -114,7 +121,9 @@ class PlejdService extends EventEmitter {
       console.log('plejd-ble: error: unable to find a bluetooth adapter that is compatible.');
       return;
     }
+    logger("Got adapter");
 
+    logger('Iterating', Object.keys(managedObjects).length, " bluetooth devices");
     for (let path of Object.keys(managedObjects)) {
       const interfaces = Object.keys(managedObjects[path]);
 
@@ -141,12 +150,14 @@ class PlejdService extends EventEmitter {
     });
 
     try {
+      logger("Starting discovery...");
       await this.adapter.StartDiscovery();
     } catch (err) {
       console.log('plejd-ble: error: failed to start discovery. Make sure no other add-on is currently scanning.');
       return;
     }
 
+    logger("Main init done, starting internal init in 1s");
     setTimeout(async () => {
       await this._internalInit();
     }, this.connectionTimeout * 1000);
@@ -225,9 +236,12 @@ class PlejdService extends EventEmitter {
     if (interfaceKeys.indexOf(BLUEZ_DEVICE_ID) > -1) {
       if (interfaces[BLUEZ_DEVICE_ID]['UUIDs'].value.indexOf(PLEJD_SERVICE) > -1) {
         logger('found Plejd service on ', path);
-        this.bleDevices.push({
-          'path': path
-        });
+        if (!this.bleDevices.some(d => d.path === path)) {
+          this.bleDevices.push({
+            'path': path
+          });
+          vrbLogger("Updated bleDevices to ", this.bleDevices);
+        }
       } else {
         console.log('uh oh, no Plejd device.');
       }
@@ -242,28 +256,28 @@ class PlejdService extends EventEmitter {
     }
   }
 
-  turnOn(id, command) {
-    console.log('Plejd got turn on command for ', id, ', brightness ', command.brightness, ', transition ', command.transition);
-    this._transitionTo(id, command.brightness, command.transition);
+  turnOn(deviceId, command) {
+    console.log('Plejd got turn on command for ', deviceId, ', brightness ', command.brightness, ', transition ', command.transition);
+    this._transitionTo(deviceId, command.brightness, command.transition);
   }
 
-  turnOff(id, command) {
-    console.log('Plejd got turn off command for ', id, ', transition ', command.transition);
-    this._transitionTo(id, 0, command.transition);
+  turnOff(deviceId, command) {
+    console.log('Plejd got turn off command for ', deviceId, ', transition ', command.transition);
+    this._transitionTo(deviceId, 0, command.transition);
   }
 
 
-  _clearDeviceTransitionTimer(id) {
-    if (this.bleDeviceTransitionTimers[id]) {
-      clearInterval(this.bleDeviceTransitionTimers[id]);
+  _clearDeviceTransitionTimer(deviceId) {
+    if (this.bleDeviceTransitionTimers[deviceId]) {
+      clearInterval(this.bleDeviceTransitionTimers[deviceId]);
     }
   }
 
-  _transitionTo(id, targetBrightness, transition) {
-    const initialBrightness = this.plejdDevices[id] ? this.plejdDevices[id].dim : null;
-    this._clearDeviceTransitionTimer(id);
+  _transitionTo(deviceId, targetBrightness, transition) {
+    const initialBrightness = this.plejdDevices[deviceId] ? this.plejdDevices[deviceId].dim : null;
+    this._clearDeviceTransitionTimer(deviceId);
 
-    const isDimmable = this.devices.find(d => d.id === id).dimmable;
+    const isDimmable = this.devices.find(d => d.id === deviceId).dimmable;
 
     if (transition > 1 && isDimmable && (initialBrightness || initialBrightness === 0) && (targetBrightness || targetBrightness === 0) && targetBrightness !== initialBrightness) {
       // Transition time set, known initial and target brightness
@@ -281,9 +295,8 @@ class PlejdService extends EventEmitter {
       const dtStart = new Date();
 
       let nSteps = 0;
-      let nSkippedSteps = 0;
 
-      this.bleDeviceTransitionTimers[id] = setInterval(() => {
+      this.bleDeviceTransitionTimers[deviceId] = setInterval(() => {
         let tElapsedMs = (new Date().getTime() - dtStart.getTime());
         let tElapsed = tElapsedMs / 1000;
         
@@ -293,20 +306,17 @@ class PlejdService extends EventEmitter {
 
         let newBrightness = parseInt(initialBrightness + deltaBrightness * tElapsed / transition);
 
+
         if (tElapsed === transition) {
           nSteps++;
-          this._clearDeviceTransitionTimer(id);
+          this._clearDeviceTransitionTimer(deviceId);
           newBrightness = targetBrightness;
-          logger('Completing transition from', initialBrightness, 'to', targetBrightness, 'in ', tElapsedMs, 'ms. Done steps', nSteps, ', skipped ' + nSkippedSteps + '. Average interval', tElapsedMs/(nSteps||1), 'ms.');
-          this._setBrightness(id, newBrightness);
-        }
-        else if (this.writeQueue.length <= this.maxQueueLengthTarget) {
-          nSteps++;
-          this._setBrightness(id, newBrightness);
+          logger('Completing queueing transition from', initialBrightness, 'to', targetBrightness, 'in ', tElapsedMs, 'ms. Steps', nSteps);
+          this._setBrightness(deviceId, newBrightness, true);
         }
         else {
-          nSkippedSteps++;
-          logger('Skipping transition step due to write queue full as configured. Queue length', this.writeQueue.length, ', max', this.maxQueueLengthTarget);
+          nSteps++;
+          this._setBrightness(deviceId, newBrightness, false);
         }
 
       }, transitionInterval);
@@ -315,37 +325,37 @@ class PlejdService extends EventEmitter {
       if (transition && isDimmable) {
         logger('Could not transition light change. Either initial value is unknown or change is too small. Requested from', initialBrightness, 'to', targetBrightness)
       }
-      this._setBrightness(id, targetBrightness);
+      this._setBrightness(deviceId, targetBrightness, true);
     }
   }
 
-  _setBrightness(id, brightness) {
+  _setBrightness(deviceId, brightness, shouldRetry) {
     if (!brightness && brightness !== 0) {
-      logger('no brightness specified, setting ', id, ' to previous known.');
-      var payload = Buffer.from((id).toString(16).padStart(2, '0') + '0110009701', 'hex');
-      this.writeQueue.unshift(payload);
+      logger('No brightness specified, Queueing turning on ', deviceId, ' to previous known.');
+      var payload = Buffer.from((deviceId).toString(16).padStart(2, '0') + '0110009701', 'hex');
+      this.writeQueue.unshift({deviceId: deviceId, log: 'ON', shouldRetry: shouldRetry, payload: payload});
     } 
     else {
       if (brightness <= 0) {
-        this._turnOff(id);
+        this._turnOff(deviceId, shouldRetry);
       }
       else {
         if (brightness > 255) {
           brightness = 255;
         }
   
-        logger('Setting ', id, 'brightness to ' + brightness);
-        brightness = brightness << 8 | brightness;
-        var payload = Buffer.from((id).toString(16).padStart(2, '0') + '0110009801' + (brightness).toString(16).padStart(4, '0'), 'hex');
+        logger('Queueing ', deviceId, 'brightness to ' + brightness);
+        const brightnessVal = brightness << 8 | brightness;
+        var payload = Buffer.from((deviceId).toString(16).padStart(2, '0') + '0110009801' + (brightnessVal).toString(16).padStart(4, '0'), 'hex');
+        this.writeQueue.unshift({deviceId: deviceId, log: 'DIM ' + brightness, shouldRetry: shouldRetry, payload: payload});
       }
-      this.writeQueue.unshift(payload);
     }
   }
 
-  _turnOff(id) {
-    logger('Turning off ', id);
-    var payload = Buffer.from((id).toString(16).padStart(2, '0') + '0110009700', 'hex');
-    this.writeQueue.unshift(payload);
+  _turnOff(deviceId, shouldRetry) {
+    logger('Queueing turning off ', deviceId);
+    var payload = Buffer.from((deviceId).toString(16).padStart(2, '0') + '0110009700', 'hex');
+    this.writeQueue.unshift({deviceId: deviceId, log: 'OFF', shouldRetry: shouldRetry, payload: payload});
   }
 
   triggerScene(sceneIndex) {
@@ -358,12 +368,12 @@ class PlejdService extends EventEmitter {
     const self = this;
 
     try {
-      //logger('sending challenge to device');
+      vrbLogger('sending challenge to device');
       await this.characteristics.auth.WriteValue([0], {});
-      //logger('reading response from device');
+      vrbLogger('reading response from device');
       const challenge = await this.characteristics.auth.ReadValue({});
       const response = this._createChallengeResponse(this.cryptoKey, Buffer.from(challenge));
-      //logger('responding to authenticate');
+      vrbLogger('responding to authenticate');
       await this.characteristics.auth.WriteValue([...response], {});
     } catch (err) {
       console.log('plejd-ble: error: failed to authenticate: ' + err);
@@ -379,30 +389,25 @@ class PlejdService extends EventEmitter {
     this.characteristics.lastData.StartNotify();
   }
 
-  async write(data, retry = true) {
+  async write(data) {
     if (!this.plejdService || !this.characteristics.data) {
-      return;
+      logger("plejdService or characteristics not available");
+      return false;
     }
 
     try {
-      logger('sending ', data.length, ' byte(s) of data to Plejd', data);
+      vrbLogger('Sending ', data.length, ' byte(s) of data to Plejd', data);
       const encryptedData = this._encryptDecrypt(this.cryptoKey, this.plejdService.addr, data);
       await this.characteristics.data.WriteValue([...encryptedData], {});
+      return true;
     } catch (err) {
       if (err.message === 'In Progress') {
-        setTimeout(() => this.write(data, retry), 1000);
-        return;
+        logger('write failed due to "In progress" ', err);
       }
-
-      console.log('plejd-ble: write failed ' + err);
-      setTimeout(async () => {
-        await this.init();
-
-        if (retry) {
-          logger('reconnected and retrying to write');
-          await this.write(data, false);
-        }
-      }, this.connectionTimeout * 1000);
+      else {
+        logger('write failed ', err);
+      }
+      return false;
     }
   }
 
@@ -411,13 +416,13 @@ class PlejdService extends EventEmitter {
     clearInterval(this.pingRef);
 
     this.pingRef = setInterval(async () => {
-      logger('ping');
+      vrbLogger('ping');
       await this.ping();
     }, 3000);
   }
 
   onPingSuccess(nr) {
-    logger('pong: ' + nr);
+    vrbLogger('pong: ' + nr);
   }
 
   async onPingFailed(error) {
@@ -429,7 +434,7 @@ class PlejdService extends EventEmitter {
   }
 
   async ping() {
-    logger('ping()');
+    vrbLogger('ping()');
 
     var ping = crypto.randomBytes(1);
     let pong = null;
@@ -454,15 +459,37 @@ class PlejdService extends EventEmitter {
 
   async startWriteQueue() {
     console.log('startWriteQueue()');
-    clearInterval(this.writeQueueRef);
+    clearTimeout(this.writeQueueRef);
 
     this.writeQueueRef = setTimeout(() => this.runWriteQueue(), this.writeQueueWaitTime);
   }
 
   async runWriteQueue() {
-    while (this.writeQueue.length > 0) {
-      const data = this.writeQueue.pop();
-      await this.write(data, true);
+    try {
+      while (this.writeQueue.length > 0) {
+        const queueItem = this.writeQueue.pop();
+        logger("Processing id", queueItem.deviceId, " Command ", queueItem.log, " Queue", this.writeQueue.length);
+
+        if (this.writeQueue.some(item => item.deviceId === queueItem.deviceId)) {
+          vrbLogger("Skipping ", queueItem.log, " due to more recent command in queue. Queue length total ", this.writeQueue.length);
+          continue; // Skip commands if new ones exist for the same deviceId, but still process all messages in order
+        }
+
+        const success = await this.write(queueItem.payload);
+        if (!success && queueItem.shouldRetry) {
+          queueItem.retryCount = (queueItem.retryCount || 0) + 1;
+          logger("Will retry command, count failed so far", queueItem.retryCount);
+          if (queueItem.retryCount <= MAX_RETRY_COUNT) {
+            this.writeQueue.push(queueItem); // Add back to queue to be processed next;
+          }
+          if (queueItem.retryCount > 1) {
+            break; // First retry directly, consecutive after writeQueueWaitTime ms
+          }
+        }
+      }
+    }
+    catch (e) {
+      console.log("Error in writeQueue loop, values probably not written to Plejd", e);
     }
 
     this.writeQueueRef = setTimeout(() => this.runWriteQueue(), this.writeQueueWaitTime);
@@ -598,7 +625,7 @@ class PlejdService extends EventEmitter {
     const cmd = decoded.toString('hex', 3, 5);
 
     if (debug) {
-      logger('raw event received: ', decoded.toString('hex'));
+      // logger('raw event received: ', decoded.toString('hex'));
     }
 
     if (cmd === BLE_CMD_DIM_CHANGE || cmd === BLE_CMD_DIM2_CHANGE) {
