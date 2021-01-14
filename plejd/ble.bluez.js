@@ -56,7 +56,8 @@ class PlejdService extends EventEmitter {
     this.writeQueueWaitTime = writeQueueWaitTime;
     this.writeQueue = [];
     this.writeQueueRef = null;
-    
+    this.delayedInit = null;
+
     // Holds a reference to all characteristics
     this.characteristics = {
       data: null,
@@ -78,8 +79,9 @@ class PlejdService extends EventEmitter {
       this.objectManager.removeAllListeners();
     }
 
+    this.bleDevices = [];
     this.connectedDevice = null;
-    
+
     this.characteristics = {
       data: null,
       lastData: null,
@@ -89,7 +91,7 @@ class PlejdService extends EventEmitter {
     };
 
     clearInterval(this.pingRef);
-    clearInterval(this.writeQueueRef);
+    clearTimeout(this.writeQueueRef);
     console.log('init()');
 
     let bluez = null;
@@ -158,9 +160,7 @@ class PlejdService extends EventEmitter {
     }
 
     logger("Main init done, starting internal init in 1s");
-    setTimeout(async () => {
-      await this._internalInit();
-    }, this.connectionTimeout * 1000);
+    return new Promise(resolve => setTimeout(() => resolve(this._internalInit()), this.connectionTimeout * 1000));
   }
 
   async _internalInit() {
@@ -230,7 +230,6 @@ class PlejdService extends EventEmitter {
   }
 
   async onInterfacesAdded(path, interfaces) {
-    // const [adapter, dev, service, characteristic] = path.split('/').slice(3);
     const interfaceKeys = Object.keys(interfaces);
 
     if (interfaceKeys.indexOf(BLUEZ_DEVICE_ID) > -1) {
@@ -291,7 +290,7 @@ class PlejdService extends EventEmitter {
 
       logger('transitioning from', initialBrightness, 'to', targetBrightness, 'in', transition, 'seconds.');
       logger('delta brightness', deltaBrightness, ', steps ', transitionSteps, ', interval', transitionInterval, 'ms');
-      
+
       const dtStart = new Date();
 
       let nSteps = 0;
@@ -299,7 +298,7 @@ class PlejdService extends EventEmitter {
       this.bleDeviceTransitionTimers[deviceId] = setInterval(() => {
         let tElapsedMs = (new Date().getTime() - dtStart.getTime());
         let tElapsed = tElapsedMs / 1000;
-        
+
         if (tElapsed > transition || tElapsed < 0) {
           tElapsed = transition;
         }
@@ -320,7 +319,7 @@ class PlejdService extends EventEmitter {
         }
 
       }, transitionInterval);
-    } 
+    }
     else {
       if (transition && isDimmable) {
         logger('Could not transition light change. Either initial value is unknown or change is too small. Requested from', initialBrightness, 'to', targetBrightness)
@@ -380,8 +379,8 @@ class PlejdService extends EventEmitter {
     }
 
     // auth done, start ping
-    await this.startPing();
-    await this.startWriteQueue();
+    this.startPing();
+    this.startWriteQueue();
 
     // After we've authenticated, we need to hook up the event listener
     // for changes to lastData.
@@ -389,8 +388,20 @@ class PlejdService extends EventEmitter {
     this.characteristics.lastData.StartNotify();
   }
 
+  async throttledInit(delay) {
+    if(this.delayedInit){
+      return this.delayedInit;
+    }
+   this.delayedInit = new Promise((resolve) => setTimeout(async () => {
+     const result = await this.init();
+     this.delayedInit = null;
+     resolve(result)
+   }, delay))
+   return this.delayedInit;
+  }
+
   async write(data) {
-    if (!this.plejdService || !this.characteristics.data) {
+    if (!data || !this.plejdService || !this.characteristics.data) {
       logger("plejdService or characteristics not available");
       return false;
     }
@@ -407,11 +418,14 @@ class PlejdService extends EventEmitter {
       else {
         logger('write failed ', err);
       }
+
+      await this.throttledInit(this.connectionTimeout * 1000);
+
       return false;
     }
   }
 
-  async startPing() {
+  startPing() {
     console.log('startPing()');
     clearInterval(this.pingRef);
 
@@ -457,7 +471,7 @@ class PlejdService extends EventEmitter {
     this.emit('pingSuccess', pong[0]);
   }
 
-  async startWriteQueue() {
+  startWriteQueue() {
     console.log('startWriteQueue()');
     clearTimeout(this.writeQueueRef);
 
