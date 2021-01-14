@@ -274,7 +274,7 @@ class PlejdService extends EventEmitter {
   }
 
   _transitionTo(deviceId, targetBrightness, transition) {
-    const initialBrightness = this.plejdDevices[deviceId] ? this.plejdDevices[deviceId].dim : null;
+    const initialBrightness = this.plejdDevices[deviceId] ? this.plejdDevices[deviceId].state && this.plejdDevices[deviceId].dim : null;
     this._clearDeviceTransitionTimer(deviceId);
 
     const isDimmable = this.devices.find(d => d.id === deviceId).dimmable;
